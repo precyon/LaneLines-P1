@@ -1,56 +1,211 @@
 # **Finding Lane Lines on the Road** 
-[![Udacity - Self-Driving Car NanoDegree](https://s3.amazonaws.com/udacity-sdc/github/shield-carnd.svg)](http://www.udacity.com/drive)
 
-<img src="examples/laneLines_thirdPass.jpg" width="480" alt="Combined Image" />
+My solution to the https://github.com/udacity/CarND-LaneLines-P1
 
-Overview
+This writeup can also be found [here](writeup.md)
+
 ---
 
-When we drive, we use our eyes to decide where to go.  The lines on the road that show us where the lanes are act as our constant reference for where to steer the vehicle.  Naturally, one of the first things we would like to do in developing a self-driving car is to automatically detect lane lines using an algorithm.
+The goals / steps this project are the following:
+* Detect lane markings on images
+* Write a pipeline to extend this to a video
 
-In this project you will detect lane lines in images using Python and OpenCV.  OpenCV means "Open-Source Computer Vision", which is a package that has many useful tools for analyzing images.  
+We use Python and OpenCV for this task.
 
-To complete the project, two files will be submitted: a file containing project code and a file containing a brief write up explaining your solution. We have included template files to be used both for the [code](https://github.com/udacity/CarND-LaneLines-P1/blob/master/P1.ipynb) and the [writeup](https://github.com/udacity/CarND-LaneLines-P1/blob/master/writeup_template.md).The code file is called P1.ipynb and the writeup template is writeup_template.md 
+## Reflection
 
-To meet specifications in the project, take a look at the requirements in the [project rubric](https://review.udacity.com/#!/rubrics/322/view)
+### 1. The pipeline
+
+Following are the steps of the pipeline.
+
+#### 1. Color segmentation
+Since the lanes have very specific range of colors, we start with color selection. This step helps narrow down on the features we're looking for for the next set of steps. We're looking for the whites and the yellows. Color selection is easier to perform in the HSV or HSL color space rather than RGB because of orthogonalization of colour and brightness.   The `select_lane_color` function does that for us. The thresholds have been manually tuned to have a reasonable selection.
+```
+def select_lane_color(img):
+    # Convert the image to HSL for accurate color selection
+    hlsImg = cv2.cvtColor(img, cv2.COLOR_RGB2HLS) 
+    
+    # A lane could either be white or yellow. Set appropriate color thresholds
+    minWhite  = np.uint8([  0, 200,   0])
+    maxWhite  = np.uint8([255, 255, 255])
+    minYellow = np.uint8([ 10,   0, 100])
+    maxYellow = np.uint8([ 40, 255, 255])
+    
+    whiteMask  = cv2.inRange(hlsImg, minWhite,  maxWhite)
+    yellowMask = cv2.inRange(hlsImg, minYellow, maxYellow)
+    
+    return cv2.bitwise_and(img, img, \
+           mask=cv2.bitwise_or(whiteMask, yellowMask))
+```
+
+![Color selection outputs on images](test_images_output/image_color_mosaic.png)
+
+#### 2. Marking the region of interest
+The roads tends have a roughly trapezoidal shape because of the perspective transformation and we therefore choose a quadrilateral ROI to select the road.  Again the points have been manually chosen but expressed in terms of image dimensions to help making this a little robust to different image inputs.
+```
+def select_roi(img):
+    height, width = img.shape[:2]
+    bottomLeft  = [width*0.075, height*1.000]
+    topLeft     = [width*0.480, height*0.550]
+    bottomRight = [width*0.950, height*1.000]
+    topRight    = [width*0.520, height*0.550] 
+    
+    vertices = np.array([[bottomLeft, topLeft, topRight, bottomRight]], \
+                        dtype=np.int32)
+    return vertices    
+```
+#### 3. Convert to grayscale
+Color information is not required for the next steps  So we convert the image to grayscale.  We use the helper function `grayscale(image)` that is already provided.
+
+#### 4. Gaussian blur
+A Gaussian blur is applied to the image to remove unwanted high frequency components that could show up after edge detection. The `gaussian_blur(img, kernel_size)` function that was already provided was used for this purpose.
+
+#### 5. Canny edge detection
+Edge detection is our first step towards lane detection.  The provided  `canny(img, low_threshold, high_threshold)` function was used for this. The `low_threshold` and the `high_threshold` were tuned manually to get a reason detection of lane edges. 
+
+#### 6. Detecting the lines with Hough transforms
+The output of the edge detection is a set of points that correspond the edges in the image. To identify straight lines from these set of points, the `cv2.HoughLinesP` from OpenCV is used. A wrapper to this in the form of `cv2.HoughLinesP(img, rho, theta, ...` is already provided. The parameters, particularly the `threshold`, `min_line_length` and `max_line_gap` were manually tuned to get a good detection of lane edges.  The output of the function is of the `[x1, y1, x2, y2]` which indicate the end co-ordinates of the line segments detected.
+
+#### 7. Find lanes from the lines
+We need to two lines, one corresponding to each of the left and right lanes. The Hough transform, however, gives us multiple line segments depending on the lane markings, lighting, noise and other features in the image. We therefore, have to use these multiple line segments to give us the two lane lines we need. We take the following approach. 
+
+For each of the lines,
+1. We find the calculate its slope and the intercept. 
+2. The images we have are fairly clean, especially in our ROI. Therefore we assume (and also observe) that all the lines we have belong to our lanes - the ones with negative slope belong to the left lane and others belong to the right lane. We therefore divide the lines into two groups. Therefore, the slope/intercept of the line corresponding to the left lane should be the mean of slopes/intercepts of all the lines in that group and similarly of the right lane. 
+
+Mean is sensitive to outliers and we sometimes notice very short noisy line segments affecting our slope estimates. The same pixel error corresponds to a larger error in slope for line segments that are shorter. We therefore,  choose to weigh every line segment according to its length. The following function does that for us.
+
+```
+def lanes_from_lines(lines):
+
+    leftLines   = []
+    leftWeights = []
+    rightLines  = []
+    rightWeights= []
+    leftLane    = None
+    rightLane   = None
+        
+    for line in lines:
+        x1, y1, x2, y2 = line[0]      
+        if x1 == x2: #ignore vertical lines
+            continue
+        slope = (y2-y1)/(x2-x1)
+        intercept = y1 - slope*x1
+        length = np.sqrt((x2-x1)**2 + (y2-y1)**2)
+        # Divide into left and right based on the slope. This criterea 
+        # should be enough for the sparse lines that we have. Might not
+        # work with the roads that have repair artifacts etc
+        if slope < 0:
+            leftLines.append((slope, intercept))
+            leftWeights.append((length))
+        else:
+            rightLines.append((slope, intercept))
+            rightWeights.append((length))
+    
+    # Smaller lines tend to be noisier. To weight larger lines higher
+    if len(leftLines)  != 0:
+        leftLane  = np.dot(leftWeights , leftLines )/np.sum(leftWeights)
+        
+    if len(rightLines) != 0:    
+        rightLane = np.dot(rightWeights, rightLines)/np.sum(rightWeights)
+    
+    return leftLane, rightLane
+```
+#### 8. Drawing the lanes
+So far we have equation of  two lines that correspond, one each corresponding to the left and the right lane. We use the following to draw these lanes on the image. 
+1. The `fill_roi_line(line, roi, fillfac=0.85)` function used to compute the line segment to be displayed from the the ROI vertices. The `fillfac` parameter is used to limit the line segment to slightly below the top limit of the ROI. 
+```
+def fill_roi_line(line, roi, fillfac=0.85):
+    """
+    Compute the line segment to be display from the line equation.
+    """
+
+    if line is None:
+        return None
+    
+    slope, intercept = line
+    
+    ymin = np.squeeze(roi)[1][1]/fillfac
+    ymax = np.squeeze(roi)[0][1]
+    
+    xmin = (ymin-intercept)/slope
+    xmax = (ymax-intercept)/slope
+    
+    return np.array([[int(xmin), int(ymin), int(xmax), int(ymax)]], dtype=np.int32)
+```
+2. The second step of the drawing takes in the two line segments and uses the following function to overlay it on the original image. The following function comes from modifying the  ` draw_lines(img, lines ... ` that is already provided. It uses the `weighted_img(drawImage, img)`  that is already provided.
+
+```
+def draw_lines_alpha(img, lines, color=[255, 0, 0], thickness=10):
+    """
+    Draws lines on the input img. Same behaviour as draw_lines except that this function adds 
+    transparency to the lines
+    """
+    drawImage = np.zeros_like(img)
+    
+    for line in lines:
+        if line is not None:
+            for x1,y1,x2,y2 in line:
+                cv2.line(drawImage, (x1, y1), (x2, y2), color, thickness)
+            
+    return weighted_img(drawImage, img)
+```
+
+### 2. The pipeline
+
+The `lane_detect(img, singleLaneLines=True)` integrates the above functions to detect and draw lanes. 
+
+```
+def lane_detect(img, singleLaneLines=True):
+    """
+    Function to take in an image (or a frame) img and output an image with 
+    annotated right and left lanes
+    
+    The singleLaneLines parameter switches between displaying just Hough lines 
+    for lanes and average single lines for each lane
+    """
+    roiVertices = select_roi(img)
+    imgRoi = region_of_interest(img, roiVertices)
+    
+    ## select colour -> convert to grayscale -> apply gaussian blur
+    grayImg = gaussian_blur(grayscale(select_lane_color(imgRoi)), 9)
+
+    ## Canny edge dectection
+    edgeImg = canny(grayImg, 50, 100)
+
+    if singleLaneLines:
+        lines = hough_lines(edgeImg, rho=1, theta=np.pi/180, threshold=30, \
+                       min_line_len=20, max_line_gap=400)
+       
+        leftLane, rightLane = lanes_from_lines(lines)
+       
+        laneLines = np.array([fill_roi_line(leftLane , roiVertices),\
+                         fill_roi_line(rightLane, roiVertices)])
+    
+        result = draw_lines_alpha(img,laneLines, thickness=20)
+    else:
+        houghImg = hough_lines_img(edgeImg, rho=1, theta=np.pi/180, 
+                         threshold=30, min_line_len=20, max_line_gap=400)
+        result = weighted_img(houghImg, img )
+    
+    return result
+```
+
+#### The results
+The results on all the images provided are stored in the `test_images_output` folder and also shown in the mosaic below.  Video ouputs are stored in the  `test_videos_output` folder.
+
+![Lane detection outputs on images](test_images_output/image_output_mosiac.png)
+
+#### Comments on the challenge video
+
+The challenge video is different from the initial test images in a couple of aspects. First, there is a continuous yellow lane marking on the left. This does not pose problems to our pipeline as we tuned our color selection thresholds well for both the whites and the yellows. Second, the ahead is curved. However, the lane markings closer to the vehicle are still straight enough for the `cv2.HoughLinesP` functions detect a good number of lines in the image.  Consequently our pipeline is robust enough to work for this video, albeit for markings relatively close to the vehicle. The output of this video is stored in the repository as `test_videos_output/challenge.mp4`.
+
+### 3. Potential shortcomings and improvements
+
+1. ROI selection is clearly not perfect. The manual selection of ROI does not scale well to all situations. For example, the ROI will be much lower in the field of view when the road either slopes down and will be much higher when it slopes up. In addition, the current ROI selection also does not work when the car is switching lanes. One could probably segment the road, perhaps using a color range and use the road as an ROI to find lanes. 
+2. The algorithm assumes lanes are straight lines. While is a reasonable assumption to make on straight or lightly curved roads, this might not be true around sharp turns. This is also a situation that needs very accurate lane keeping and steering control. So lane detection performance would probably be critically important in this situation.  If the roads are assumed to be circular arcs it should be possible to describe the lane parametrically after a perspective transformation of the arc. Hough transform should generalize to such parametric curves. If the curve is not parametrically known, a graph search based method can be used on the gradient to follow the lane markings.
+3. After Hough transform finds the lines, we assume they either belong to one of the lanes. This assumption could fail under certain lighting conditions and when there are construction artifacts on the road. These lines can corrupt our slope estimates. We could filter the estimates by choosing the lines in a certain range of slopes. A starting point for this range could be computed theoretically by assuming a range in the lane widths and knowing the perspective transform of the camera. 
 
 
-Creating a Great Writeup
----
-For this project, a great writeup should provide a detailed response to the "Reflection" section of the [project rubric](https://review.udacity.com/#!/rubrics/322/view). There are three parts to the reflection:
 
-1. Describe the pipeline
-
-2. Identify any shortcomings
-
-3. Suggest possible improvements
-
-We encourage using images in your writeup to demonstrate how your pipeline works.  
-
-All that said, please be concise!  We're not looking for you to write a book here: just a brief description.
-
-You're not required to use markdown for your writeup.  If you use another method please just submit a pdf of your writeup. Here is a link to a [writeup template file](https://github.com/udacity/CarND-LaneLines-P1/blob/master/writeup_template.md). 
-
-
-The Project
----
-
-## If you have already installed the [CarND Term1 Starter Kit](https://github.com/udacity/CarND-Term1-Starter-Kit/blob/master/README.md) you should be good to go!   If not, you should install the starter kit to get started on this project. ##
-
-**Step 1:** Set up the [CarND Term1 Starter Kit](https://classroom.udacity.com/nanodegrees/nd013/parts/fbf77062-5703-404e-b60c-95b78b2f3f9e/modules/83ec35ee-1e02-48a5-bdb7-d244bd47c2dc/lessons/8c82408b-a217-4d09-b81d-1bda4c6380ef/concepts/4f1870e0-3849-43e4-b670-12e6f2d4b7a7) if you haven't already.
-
-**Step 2:** Open the code in a Jupyter Notebook
-
-You will complete the project code in a Jupyter notebook.  If you are unfamiliar with Jupyter Notebooks, check out <A HREF="https://www.packtpub.com/books/content/basics-jupyter-notebook-and-python" target="_blank">Cyrille Rossant's Basics of Jupyter Notebook and Python</A> to get started.
-
-Jupyter is an Ipython notebook where you can run blocks of code and see results interactively.  All the code for this project is contained in a Jupyter notebook. To start Jupyter in your browser, use terminal to navigate to your project directory and then run the following command at the terminal prompt (be sure you've activated your Python 3 carnd-term1 environment as described in the [CarND Term1 Starter Kit](https://github.com/udacity/CarND-Term1-Starter-Kit/blob/master/README.md) installation instructions!):
-
-`> jupyter notebook`
-
-A browser window will appear showing the contents of the current directory.  Click on the file called "P1.ipynb".  Another browser window will appear displaying the notebook.  Follow the instructions in the notebook to complete the project.  
-
-**Step 3:** Complete the project and submit both the Ipython notebook and the project writeup
-
-## How to write a README
-A well written README file can enhance your project and portfolio.  Develop your abilities to create professional README files by completing [this free course](https://www.udacity.com/course/writing-readmes--ud777).
 
